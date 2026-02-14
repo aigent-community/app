@@ -1,184 +1,142 @@
-# SaaS-on-CF (Software as a Service on Cloudflare)
+# aigent.community
 
-Modular web application template
+LLM token sharing marketplace. Subscription owners share unused Claude tokens with others via real-time chat sessions. Internal credit economy — no real money changes hands.
+
+## How It Works
+
+**Providers** share their LLM access by creating token pools with custom limits (models, daily caps, time windows, pricing in credits).
+
+**Consumers** browse the marketplace, pick a pool, start a chat session. Credits are reserved upfront, settled on session end.
+
+Two proxy modes:
+- **Local proxy** — provider runs CLI agent, API key never leaves their machine
+- **API key delegation** — provider stores encrypted key on platform (Phase 5+)
 
 ## Architecture
 
-Monorepo using [pnpm workspace](https://pnpm.io/workspaces) with modular packages shared across apps:
-
-- [apps/user-application](./apps/user-application/) - TanStack Start consumer-facing app
-- [apps/data-service](./apps/data-service/) - Backend service for long-running tasks
-- [packages/data-ops](./packages/data-ops/) - Shared DB layer (schemas, queries, auth)
-
-Stack: 
-
-- [Better Auth](https://www.better-auth.com/docs/introduction), 
-- [Drizzle ORM](https://orm.drizzle.team/docs/overview), 
-- [Cloudflare Workers](https://developers.cloudflare.com/workers/), 
-- [Neon Postgres](https://neon.tech).
-
-## [packages/data-ops](./packages/data-ops/)
-
-Central shared package for all database operations. Both apps consume this package for type-safe DB access.
-
-**Purpose**: Single source of truth for database schemas, queries, validations, and auth config.
-
-### Directory Structure
-
-#### [`src/drizzle/`](./packages/data-ops/src/drizzle/)
-Core database definitions using Drizzle ORM.
-
-- **`schema.ts`** - Main application tables
-- **`auth-schema.ts`** - Better Auth tables (auto-generated, don't edit manually)
-- **`relations.ts`** - Drizzle relational queries config (defines joins between tables)
-- **`migrations/{env}/`** - Migration history per environment (dev/staging/production)
-
-#### [`src/queries/`](./packages/data-ops/src/queries/)
-Reusable database operations exported as functions.
-
-Example: `user.ts` exports `getUser()`
-
-**Usage**: Import and call from apps - handles DB connection internally via `getDb()`.
-
-```ts
-import { getUser } from "data-ops/queries/user";
-const user = await getUser(userId);
+```
+Browser (Consumer/Provider)
+  | WebSocket + REST
+TanStack Start SSR Worker ──service binding──> Hono API Worker
+                                                ├─ SessionAgent (per session, Cloudflare Agents SDK)
+                                                ├─ ProviderAgent (per provider, Cloudflare Agents SDK)
+                                                ├─ KV (pool cache, online status)
+                                                ├─ Queues (usage-log, credit-tx)
+                                                └─ Neon PostgreSQL
+Provider CLI Agent
+  | WebSocket
+ProviderAgent
 ```
 
-#### [`src/zod-schema/`](./packages/data-ops/src/zod-schema/)
-Validation schemas using Zod.
-- API request/response
-- Forms
-- DTOs
+### Session Flow
 
-**Naming conventions:**
+1. Consumer creates session → credits reserved
+2. Consumer connects via WebSocket → SessionAgent initialized
+3. Messages route through LLM proxy (API key or local proxy mode)
+4. Response streams back as chunks with live token counters
+5. Budget warnings at 80% and 95%
+6. Session end → credits settled, provider earns credits
 
-| Purpose      | Suffix         | Example                 |
-|--------------|----------------|-------------------------|
-| Domain model | Schema         | UserSchema              |
-| Request      | RequestSchema  | UserCreateRequestSchema |
-| Response     | ResponseSchema | UserListResponseSchema  |
-| Type         | no suffix      | User, UserCreateInput   |
+## Tech Stack
 
-**Purpose**: Type-safe contracts between frontend/backend. Validates data shape at runtime.
+Built on [saas-on-cf](https://github.com/AuditMos/saas-on-cf) template by Auditmos.
 
-Example: `user.ts` exports `UserSchema` schema.
+| Layer | Tech |
+|-------|------|
+| Frontend | React 19 + TanStack Start (SSR on CF Workers) |
+| API | Hono on Cloudflare Workers |
+| Realtime | Cloudflare Agents SDK (Durable Objects) + WebSocket |
+| Database | Drizzle ORM + Neon Postgres |
+| Auth | Better Auth |
+| Queues | Cloudflare Queues (usage logging, credit processing) |
+| CLI | Node.js (commander + ws) |
 
-#### [`src/database/`](./packages/data-ops/src/database/)
-- **`setup.ts`** - DB client initialization (`getDb()` function)
-- **`seed/`** - Data seeding utilities
+## Monorepo Structure
 
-#### [`src/auth/`](./packages/data-ops/src/auth/)
-Better Auth configuration.
-- **`setup.ts`** - Auth config (providers, plugins)
-- **`server.ts`** - Auth server instance
+```
+apps/
+  user-application/       # SSR frontend (TanStack Start)
+  data-service/           # REST API + Agents (Hono on CF Workers)
+  cli/                    # Provider CLI agent (Node.js)
 
-### Workflow for New DB Features
-
-1. **Add table** to `src/drizzle/schema.ts`
-2. **Add relations** to `src/drizzle/relations.ts` (if needed)
-3. **Generate migration**: `pnpm run drizzle:dev:generate`
-4. **Apply migration**: `pnpm run drizzle:dev:migrate`
-5. **Create queries** in `src/queries/{feature}.ts`
-6. **Create Zod schemas** in `src/zod-schema/{feature}.ts`
-7. **Rebuild package**: `pnpm run build:data-ops`
-8. **Import in apps**: Use queries/schemas from both apps:
-- [user-application](./apps/user-application/)
-- [data-service](./apps/data-service/)
-
-## Setup
-
-```bash
-pnpm run setup
+packages/
+  data-ops/               # Shared DB layer (Drizzle, Zod, Better Auth)
 ```
 
-Installs all dependencies and builds data-ops package.
+## Key Entities
+
+| Entity | Purpose |
+|--------|---------|
+| `provider_config` | Provider settings — mode, model allowlist, reputation |
+| `token_pool` | Shareable token bucket — limits, pricing, schedule |
+| `llm_session` | Active/completed chat session between consumer & pool |
+| `credit_balance` | User's available + reserved credits |
+| `credit_ledger` | Full credit transaction history |
+| `usage_log` | Per-request token usage metrics |
 
 ## Development
 
 ```bash
-pnpm run dev:user-application  # TanStack Start app (port 3000)
-pnpm run dev:data-service      # Hono backend service (port 8788)
+pnpm run setup                    # install + build data-ops
+pnpm run dev:user-application     # frontend (port 3000)
+pnpm run dev:data-service         # API (port 8788)
 ```
 
-### Database Migrations
-
-From `packages/data-ops/` directory:
+### Database
 
 ```bash
-pnpm run drizzle:dev:generate  # Generate migration
-pnpm run drizzle:dev:migrate   # Apply to database
+# from packages/data-ops/
+pnpm run drizzle:dev:generate     # generate migration
+pnpm run drizzle:dev:migrate      # apply migration
 ```
 
-Replace `dev` with `staging` or `production`. Migrations stored in `src/drizzle/migrations/{env}/`.
+Replace `dev` with `staging` or `production` for other environments.
 
 ### Environment Variables
 
-Config files in `packages/data-ops/`:
-- `.env.dev` - Local development
-- `.env.staging` - Staging
-- `.env.production` - Production
+Config in `packages/data-ops/`:
+- `.env.dev` — local development
+- `.env.staging` — staging
+- `.env.production` — production
 
-Replace dev` with `staging` or `production`. 
-
-Migrations stored in `src/drizzle/migrations/{env}/`.
-
-Sample `.env` file with minimum number of values available - [.env.example](./packages/data-ops/.env.example)
+See [.env.example](./packages/data-ops/.env.example) for required values.
 
 ## Deployment
 
-### Cloudflare Account Configuration
-
-To deploy to a Cloudflare account different from the one globally logged in on your machine:
-
-1. Copy the example env file in the root directory:
-   ```bash
-   cp .env.example .env
-   ```
-2. Fill in `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` with values from the target account.
-
-This overrides global Cloudflare credentials for deployments without changing your machine-wide config.
-
-### User Application
-
-Once the deployment is done, Cloudflare will response with URL to view the deployment. If you want to change the name associated with Worker, do so by changing the `name` in the [wrangler.jsonc](./apps/user-application/wrangler.jsonc) file.
-
-You can also use your own domain names associated with Cloudflare account by adding a route to this file as well.
-
-#### Staging Environment
-
 ```bash
+# Staging
 pnpm run deploy:staging:user-application
-```
-
-This will deploy the [user-application](./apps/user-application/) to Cloudflare Workers into staging environment.
-
-#### Production Environment
-
-```bash
-pnpm run deploy:production:user-application
-```
-
-This will deploy the [user-application](./apps/user-application/) to Cloudflare Workers into production environment.
-
-### Data Service
-
-Once the deployment is done, Cloudflare will response with URL to view the deployment. If you want to change the name associated with Worker, do so by changing the `name` in the [wrangler.jsonc](./apps/data-service/wrangler.jsonc) file.
-
-You can also use your own domain names associated with Cloudflare account by adding a route to this file as well.
-
-#### Staging Environment
-
-```bash
 pnpm run deploy:staging:data-service
-```
 
-This will deploy the [data-service](./apps/data-service/) to Cloudflare Workers into staging environment.
-
-#### Production Environment
-
-```bash
+# Production
+pnpm run deploy:production:user-application
 pnpm run deploy:production:data-service
 ```
 
-This will deploy the [data-service](./apps/data-service/) to Cloudflare Workers into production environment.
+## Implementation Phases
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 1 | Schema + Auth — Drizzle tables, provider/pool CRUD, credit init | |
+| 2 | Core Session — Agents, chat UI, LLM proxy, token metering, credits | |
+| 3 | Marketplace + Dashboards — browse pools, provider/consumer dashboards, queues | |
+| 4 | CLI Agent + Local Proxy — CLI scaffolding, WS client, LLM forwarding | |
+| 5 | Polish — budget warnings, export, rate limiting, encryption, reputation | |
+
+## Design Docs
+
+Full specifications live in `/docs`:
+
+```
+docs/
+├── PLAN.md                        # Master plan
+├── 001-schema-and-auth/           # DB schema, Zod, queries, API routes, migrations
+├── 002-core-session/              # SessionAgent, LLM proxy, credit engine, WS protocol, chat UI
+├── 003-marketplace-and-dashboards/# Marketplace API, credits API, queues, dashboard UI
+├── 004-cli-agent-local-proxy/     # CLI scaffold, WS client, message router, auth tokens
+└── 005-polish/                    # Warnings, export, time windows, rate limits, encryption
+```
+
+## License
+
+Proprietary.
