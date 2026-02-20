@@ -1,6 +1,7 @@
 {
-  "short_name": "TanStack App",
-  "name": "Create TanStack App Sample",
+  "short_name": "aigent",
+  "name": "aigent — Org Agent Alignment",
+  "description": "Align your team's AI agents with organizational vision. Context layer for Claude Code.",
   "icons": [
     {
       "src": "favicon.ico",
@@ -18,8 +19,9 @@
       "sizes": "512x512"
     }
   ],
-  "start_url": ".",
+  "start_url": "/",
   "display": "standalone",
-  "theme_color": "#000000",
-  "background_color": "#ffffff"
+  "theme_color": "#0a0a0a",
+  "background_color": "#0a0a0a",
+  "categories": ["business", "productivity", "developer-tools"]
 }

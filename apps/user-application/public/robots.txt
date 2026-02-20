@@ -1,3 +1,9 @@
 # https://www.robotstxt.org/robotstxt.html
 User-agent: *
-Disallow:
+Allow: /
+Disallow: /app/
+Disallow: /api/
+Disallow: /rpc/
+Disallow: /_auth/
+
+Sitemap: https://aigent.app/sitemap.xml

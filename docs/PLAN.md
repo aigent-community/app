@@ -2,7 +2,9 @@
 
 ## Context
 
-Platform for aligning AI agents across an organization. Boss defines vision/rules, employees use Claude Code (with their own keys), platform ensures every agent works toward the same goals via shared context and mandatory activity reporting.
+Shared context layer for dev teams using AI coding agents. Tech lead sets vision/rules, devs connect Claude Code via MCP, every agent gets org context and reports what it did.
+
+Generic architecture — works for any org with MCP-capable agents, but v1 messaging targets engineering teams.
 
 Built on existing `saas-on-cf` boilerplate (React 19 + TanStack Start, Hono on CF Workers, Drizzle + Neon Postgres, Better Auth).
 
@@ -83,12 +85,12 @@ apps/
         activity.ts           # report_activity, get_recent_activities tools
     routes/
       orgs.ts                 # org CRUD
-      vision.ts               # vision doc CRUD (versioned)
+      vision.ts               # vision doc CRUD
       activities.ts           # activity feed
       memory.ts               # shared memory CRUD
       members.ts              # member management + invites
     services/
-      vision-service.ts       # version control for org context
+      vision-service.ts       # vision doc ops
       activity-service.ts     # activity ingestion + feed
       memory-service.ts       # knowledge base ops
       member-service.ts       # invite, roles, seat management
@@ -96,7 +98,7 @@ apps/
   user-application/src/routes/
     _auth/org/$orgId/
       dashboard.tsx           # admin: activity feed, alignment overview
-      vision.tsx              # admin: CLAUDE.md editor (versioned)
+      vision.tsx              # admin: CLAUDE.md editor
       members.tsx             # admin: invite, manage members
       memory.tsx              # shared knowledge base browser
       settings.tsx            # org settings, billing
@@ -106,7 +108,7 @@ apps/
 packages/
   data-ops/src/drizzle/schema/
     organizations.ts          # org, org_member
-    vision.ts                 # vision docs (versioned)
+    vision.ts                 # vision docs
     activities.ts             # activity log
     memory.ts                 # shared memory entries
     api-tokens.ts             # MCP auth tokens
@@ -137,7 +139,8 @@ packages/
 |--------|------|-------|
 | id | text PK | ulid |
 | org_id | text FK→organization | |
-| user_id | text FK→user | |
+| user_id | text FK→user nullable | null until user signs up |
+| email | text | invite target |
 | role | enum | admin / member |
 | joined_at | timestamp | |
 | is_active | boolean | |
@@ -147,13 +150,13 @@ packages/
 |--------|------|-------|
 | id | text PK | ulid |
 | org_id | text FK→organization | |
-| version | int | auto-increment per org |
 | title | text | e.g. "Architecture Rules" |
 | content | text | markdown content |
 | category | enum | rules / decisions / context / goals |
-| is_active | boolean | soft-delete, only latest version served |
-| created_by | text FK→user | who wrote this version |
+| is_active | boolean | soft-delete |
+| created_by | text FK→user | |
 | created_at | timestamp | |
+| updated_at | timestamp | |
 
 ### activity_log
 | Column | Type | Notes |
@@ -174,7 +177,7 @@ packages/
 | id | text PK | ulid |
 | org_id | text FK→organization | |
 | content | text | the knowledge/learning |
-| category | enum | pattern / decision / convention / learning |
+| category | text nullable | free-form, categories emerge from usage |
 | source_activity_id | text FK→activity_log nullable | where this came from |
 | created_by | text FK→user | |
 | is_active | boolean | |
@@ -191,13 +194,13 @@ packages/
 | last_used_at | timestamp nullable | |
 | expires_at | timestamp nullable | |
 | is_active | boolean | |
+| created_at | timestamp | |
 
 ## Enums
 
 ```
 orgMemberRoleEnum: admin | member
 visionCategoryEnum: rules | decisions | context | goals
-memoryCategoryEnum: pattern | decision | convention | learning
 ```
 
 ## API Endpoints
@@ -212,10 +215,9 @@ POST            /api/orgs/:id/members/invite
 GET             /api/orgs/:id/members
 PATCH/DEL       /api/orgs/:id/members/:memberId
 
-# Vision (versioned context docs)
+# Vision (context docs)
 POST/GET        /api/orgs/:id/vision
 GET/PATCH/DEL   /api/orgs/:id/vision/:docId
-GET             /api/orgs/:id/vision/:docId/history    # version history
 
 # Activities (agent reports)
 POST            /api/orgs/:id/activities               # MCP server calls this
@@ -262,7 +264,7 @@ Agent reports what it did. Called at end of task or periodically.
 Input: `{ summary: string, filesChanged?: string[], decisionsMade?: string[], tags?: string[] }`
 Output: `{ id: string, memoryExtracted?: string }`
 
-Server-side: activity is stored, and optionally a shared_memory entry is auto-extracted from significant decisions.
+Server-side: activity is stored; all `decisionsMade[]` entries auto-extracted as shared_memory rows.
 
 ### get_recent_activities
 See what other agents in the org are doing.
@@ -276,8 +278,9 @@ Output: `{ activities: Activity[] }`
 - MCP server authenticates via `at_` prefixed API tokens (SHA-256 hashed in DB)
 - Token scoped to specific org (user must be active member)
 - All inputs validated with Zod
-- Vision docs versioned — edits create new version, old versions retained
+- Vision docs editable in-place (versioning deferred to Phase 5)
 - Activity reporting mandatory — MCP server enforces via tool availability
+- Rate limiting on MCP endpoints from Phase 2 (KV counter per token)
 
 ## Implementation Phases
 
@@ -285,48 +288,39 @@ Output: `{ activities: Activity[] }`
 - Drizzle schema + migrations for all tables
 - Better Auth setup (email/password, session)
 - Organization CRUD (create, read, update)
-- Member management (invite by email, roles: admin/member)
+- Member management (invite by email → pending row, claimed on signup)
 - API token CRUD (generate `at_` tokens, revoke, list)
 
-### Phase 2 — Vision Store + Activity Feed (core)
-- Vision document CRUD (versioned, categorized)
-- Vision editor page (markdown editor with live preview)
-- Activity log ingestion endpoint
-- Activity feed page (filterable by user, date, tags)
-- Shared memory CRUD
-- Memory browser page with search
-
-### Phase 3 — MCP Server (the product)
+### Phase 2 — MCP Server (the product)
 - Remote MCP server on CF Workers (SSE transport)
-- `get_organization_context` tool
-- `get_shared_memory` + `search_decisions` tools
-- `report_activity` tool (mandatory)
-- `get_recent_activities` tool
+- All 5 MCP tools
 - MCP auth middleware (token validation, org membership check)
+- KV-based rate limiting per token
 - MCP setup page (connection instructions, `.mcp.json` snippet with token)
 
-### Phase 4 — Dashboard + Alignment (boss value)
-- Admin dashboard: activity feed overview, per-member breakdown
-- Activity timeline visualization
-- Memory auto-extraction from activities (when agent reports significant decisions)
-- Alignment alerts (admin can flag activities as misaligned)
-- Org settings: seat management, billing
+### Phase 3 — Vision + Activity UI
+- Vision editor (simple textarea + save)
+- Vision doc list page (by category)
+- Activity feed (chronological, no filters)
+- Vision + activity API endpoints
 
-### Phase 5 — Polish
-- Vision doc diffing (compare versions)
-- Activity search (full-text)
-- Memory relevance scoring
-- Rate limiting per token
-- Self-hostable deployment guide (wrangler.jsonc template)
-- Org-level CLAUDE.md export (download as file for offline use)
+### Phase 4 — Dashboard + Memory (boss value)
+- Single dashboard page: activity feed + member list + counts
+- Memory auto-extraction from `decisionsMade[]` in activities
+- Memory browser page with ILIKE search
+- CLAUDE.md export (generate markdown from vision docs)
+
+### Phase 5 — Iteration (build when users ask)
+- Vision versioning + diff view
+- Activity filters (date, user, tags)
+- Full-text search (tsvector upgrade)
+- Memory categories + relevance scoring
+- Self-hostable deployment guide
 
 ### Phase 6 — Cloudflare Sandbox (post-MVP)
-- CF Containers integration
+- CF Containers integration (blocked on GA)
 - Run Claude Code in cloud container with org context pre-injected
-- Container gets `.claude/CLAUDE.md` auto-generated from vision store
-- Container gets `.mcp.json` pre-configured
-- Web terminal UI for sandbox access
-- R2 persistent workspace per user
+- Web terminal UI, R2 persistent workspace
 
 ## Resolved Decisions
 
@@ -336,9 +330,13 @@ Output: `{ activities: Activity[] }`
 4. Shared memory scoped per-org
 5. Auth: Better Auth with email/password now, Google OAuth later
 6. Pricing: per-seat
-7. Vision docs versioned — every edit creates new version
+7. Vision docs edit in-place for v1 — versioning deferred to Phase 5
 8. MCP transport: SSE (standard for remote MCP servers)
 9. API tokens prefixed `at_`, stored as SHA-256 hash, scoped to one org
 10. No Anthropic API proxying — zero legal risk
-11. Activity auto-extracts shared memory from significant decisions (Phase 4)
+11. All `decisionsMade[]` auto-extracted as shared memory (Phase 4)
 12. Self-hostable: same codebase, different wrangler config + own Neon DB
+13. Rate limiting on MCP from Phase 2 — KV counter per token
+14. Invite flow: pending member row with email, `userId` backfilled on signup
+15. No `memoryCategoryEnum` — free-form text, categories emerge from usage
+16. Positioning: dev teams as wedge (Claude Code), architecture org-agnostic — no dev-specific assumptions in schema/product
