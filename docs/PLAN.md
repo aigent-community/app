@@ -1,382 +1,344 @@
-# aigent.community - LLM Token Sharing Marketplace
+# aigent — Organizational Agent Context Layer
 
 ## Context
 
-System allowing LLM subscription owners to share tokens with others via marketplace. Provider runs local agent or delegates API key; consumer browses pools on web UI, uses tokens in real-time chat sessions. Internal credit economy.
+Platform for aligning AI agents across an organization. Boss defines vision/rules, employees use Claude Code (with their own keys), platform ensures every agent works toward the same goals via shared context and mandatory activity reporting.
 
 Built on existing `saas-on-cf` boilerplate (React 19 + TanStack Start, Hono on CF Workers, Drizzle + Neon Postgres, Better Auth).
 
 ## Architecture
 
 ```
-Browser (Consumer/Provider)
-  ↕ WebSocket + REST
+Employee's Claude Code (BYOK — own API key)
+  ↕ MCP protocol (stdio → remote)
+Remote MCP Server (CF Worker)
+  ├─ get_organization_context    → org vision, rules, decisions
+  ├─ get_shared_memory           → org knowledge base
+  ├─ report_activity             → mandatory: what agent did
+  ├─ get_recent_activities       → what other agents are doing
+  └─ search_decisions            → past decisions/patterns
+  ↕ service binding
+Hono API Worker
+  ├─ /api/orgs                   → org CRUD
+  ├─ /api/orgs/:id/vision        → version-controlled context docs
+  ├─ /api/orgs/:id/activities    → activity feed
+  ├─ /api/orgs/:id/memory        → shared knowledge base
+  ├─ /api/orgs/:id/members       → member management
+  └─ Neon PostgreSQL
+
 TanStack Start SSR Worker ──service binding──► Hono API Worker
-                                                ├─ SessionAgent (per session, agents-sdk)
-                                                ├─ ProviderAgent (per provider, agents-sdk)
-                                                ├─ KV (pool cache, online status)
-                                                ├─ Queues (usage-log, credit-tx)
-                                                └─ Neon PostgreSQL
-Provider CLI Agent
-  ↕ WebSocket
-ProviderAgent
+  └─ Dashboard (boss: vision editor, activity feed, members)
+                (employee: org context, own activity, shared memory)
+
+[Post-MVP] Cloudflare Sandbox (CF Containers)
+  └─ Optional: run Claude Code in cloud container with org context pre-injected
 ```
 
-### Two proxy modes
+### How it works
 
-1. **API key delegation** — provider stores encrypted key on platform, platform calls Claude API directly
-2. **Local proxy** — provider runs CLI agent, platform routes requests via WebSocket to agent, agent calls Claude API locally
+1. Boss creates org → writes vision (structured CLAUDE.md + rules + decisions)
+2. Employee connects Claude Code via MCP server (`.mcp.json`)
+3. On every session, agent calls `get_organization_context` → gets boss's vision
+4. Agent calls `get_shared_memory` → gets org knowledge base
+5. Agent works → **must** call `report_activity` with summary of what it did
+6. Boss sees activity feed in dashboard → can flag misalignment
+7. Learnings from one agent propagate to all via shared memory
 
-## Monorepo Structure (new/modified)
+### Employee setup
 
-```
-apps/
-  cli/                          # NEW - provider CLI agent (Node.js)
-    src/
-      index.ts                  # entry (commander)
-      commands/start.ts         # connect + proxy
-      commands/status.ts        # check sessions/tokens
-      proxy/ws-client.ts        # WS to platform
-      proxy/llm-forwarder.ts    # forward to Claude API
-
-  data-service/src/             # MODIFIED
-    agents/
-      session-agent.ts          # per-session Agent (extends Agent from agents-sdk)
-      provider-agent.ts         # per-provider Agent for CLI bridge
-    routes/
-      pools.ts                  # CRUD token pools
-      sessions.ts               # session lifecycle
-      credits.ts                # balance + history
-      marketplace.ts            # browse pools
-      ws.ts                     # WS upgrade → DOs
-    services/
-      llm-proxy.ts              # Claude API streaming proxy
-      token-meter.ts            # extract usage from API response
-      credit-engine.ts          # reserve/settle/refund
-    queue-handlers/
-      usage-logger.ts           # batch insert usage
-      credit-processor.ts       # settle credits
-
-  user-application/src/routes/  # MODIFIED
-    pools/index.tsx             # browse marketplace
-    pools/$poolId.tsx           # pool detail
-    session/$sessionId.tsx      # chat UI + token counter
-    _auth/dashboard/provider.tsx
-    _auth/dashboard/consumer.tsx
-    _auth/settings/api-keys.tsx
-
-packages/
-  data-ops/src/drizzle/schema/ # MODIFIED - new tables
-    providers.ts
-    pools.ts
-    sessions.ts
-    credits.ts
-    usage.ts
-  data-ops/src/zod-schema/     # MODIFIED - new DTOs + WS types
-    ws-messages.ts              # WebSocket message protocol types
-    pool.ts                     # pool request/response schemas
-    session.ts                  # session DTOs
-    credit.ts                   # credit DTOs
-```
-
-## Database Schema (new tables)
-
-### provider_config
-| Column | Type | Notes |
-|--------|------|-------|
-| id | text PK | ulid |
-| user_id | text FK→user | |
-| mode | enum | local_proxy \| api_key |
-| llm_provider | text | "claude" default |
-| encrypted_api_key | text | null if local_proxy |
-| model_allowlist | jsonb | string[] |
-| is_active | boolean | |
-| last_seen_at | timestamp | heartbeat |
-| reputation_score | real | 0.0–5.0, default 5.0 |
-| total_sessions_served | int | |
-| total_tokens_served | bigint | |
-
-### token_pool
-| Column | Type | Notes |
-|--------|------|-------|
-| id | text PK | |
-| provider_id | text FK→provider_config | |
-| name, description | text | |
-| status | enum | active/paused/depleted/revoked |
-| available_from/to | text | "09:00"/"17:00" UTC |
-| available_days | jsonb | [1,2,3,4,5] (0=Sun JS convention) |
-| max_tokens_per_session | int | |
-| max_tokens_per_day | int | |
-| daily_tokens_used | int | resets daily |
-| allowed_use_cases | jsonb | ["coding","writing"] |
-| allowed_models | jsonb | ["claude-sonnet-4-20250514","claude-haiku-4-5-20251001"] |
-| credits_per_input_k_token | int | |
-| credits_per_output_k_token | int | |
-| max_concurrent_sessions | int | |
-
-### llm_session
-| Column | Type | Notes |
-|--------|------|-------|
-| id | text PK | |
-| pool_id | text FK | |
-| consumer_id, provider_id | text FK→user | |
-| status | enum | pending/active/ending/completed/aborted/timeout |
-| input/output_tokens_used | int | |
-| model | text | claude model used |
-| max_tokens_budget | int | output tokens only |
-| credits_charged/reserved | int | |
-| end_reason | enum | tokens_exhausted/time_window/user_ended/provider_revoked/provider_disconnected/error |
-
-### credit_balance
-| Column | Type |
-|--------|------|
-| user_id | text PK FK→user |
-| available | int |
-| reserved | int |
-
-### credit_ledger
-| Column | Type | Notes |
-|--------|------|-------|
-| id | text PK | |
-| user_id | text FK | |
-| amount | int | +credit / -debit |
-| type | enum | signup_bonus/provider_earning/consumer_spend/refund |
-| session_id | text FK nullable | |
-| balance_after | int | |
-
-### usage_log
-| Column | Type |
-|--------|------|
-| id | text PK |
-| session_id | text FK |
-| request_index | int |
-| input/output_tokens | int |
-| model | text |
-| latency_ms | int |
-
-## API Endpoints
-
-```
-# Provider config
-POST/PATCH/GET  /api/provider/config
-GET             /api/provider/stats
-
-# Pools
-POST/GET        /api/pools
-PATCH/DELETE     /api/pools/:id
-POST            /api/pools/:id/pause|resume
-
-# Marketplace
-GET             /api/marketplace?useCase=&minTokens=&sort=
-
-# Sessions
-POST            /api/sessions           { poolId, maxTokensBudget }
-GET             /api/sessions/:id
-POST            /api/sessions/:id/end
-POST            /api/sessions/:id/summarize
-
-# Credits
-GET             /api/credits/balance
-GET             /api/credits/history
-
-# WebSocket upgrades (custom Hono WS routes with auth middleware)
-GET             /api/ws/session/:sessionId    → SessionAgent
-GET             /api/ws/provider              → ProviderAgent
-```
-
-## Agents (Cloudflare Agents SDK on Durable Objects)
-
-Uses `agents-sdk` npm — framework on top of DOs. Same runtime/billing/limits, better DX.
-Key features used: `this.state` auto-sync, multi-schedule, `@callable()` RPC, WS hibernation, `useAgentChat()` React hook.
-
-### SessionAgent (1 per active session)
-
-```typescript
-class SessionAgent extends Agent<Env, SessionState> {
-  // state auto-persisted + auto-synced to consumer WS
-  // SessionState = { tokens, credits, history, budget, status }
-
-  @callable()
-  async streamResponse(message: string): Promise<void>
-
-  @callable()
-  async endSession(): Promise<void>
-
-  @callable()
-  async summarizeSession(): Promise<string>
-
-  @callable()
-  async exportSession(format: "md" | "json"): Promise<string>
-
-  // Multi-schedule (replaces single alarm)
-  // this.schedule("30m", "checkIdle")
-  // this.schedule(poolCloseTime, "endByTimeWindow")
-  // this.schedule("periodic", "1m", "syncCredits")
-
-  onConnect(connection, ctx): void  // auth check, setup
-  onMessage(connection, message): void  // chat messages
-  onClose(connection, code, reason): void  // cleanup
-}
-```
-
-- `this.state` with token counters auto-broadcasts to consumer WS → live token counter
-- At 80%: `session_warning` via broadcast
-- At 95%: second warning + prompt to save/summarize
-- On end: settle credits via Queue, persist final state to DB
-- **Conversation stored in Agent state only (ephemeral)** — UI must clearly warn user:
-  - Banner on session start: "Conversation is NOT persisted. Save/export before ending."
-  - Persistent indicator showing session is ephemeral
-  - Before session ends: modal with save/compress/summarize options
-  - Export formats: markdown, JSON
-
-### ProviderAgent (1 per provider)
-
-```typescript
-class ProviderAgent extends Agent<Env, ProviderState> {
-  // ProviderState = { online, activeRequests, stats }
-
-  @callable()
-  async forwardLlmRequest(request: LlmRequest): Promise<void>
-  // streaming: ProviderAgent calls back SessionAgent via getAgentByName() per chunk
-
-  @callable()
-  async isOnline(): Promise<boolean>
-
-  @callable()
-  async getStats(): Promise<ProviderStats>
-
-  onConnect(connection, ctx): void  // CLI agent connects
-  onMessage(connection, message): void  // CLI agent responses
-  onClose(connection, code, reason): void  // mark offline → KV
-}
-```
-
-- Maintains WS to CLI agent
-- Multiplexes requests from multiple SessionAgents via `@callable`
-- Heartbeat via `this.schedule("periodic", "30s", "heartbeat")`
-- Online status → KV
-
-## Session Flow
-
-1. Consumer `POST /api/sessions` → credits pre-authorized (reserved)
-2. Consumer connects WS → SessionDO initialized
-3. Consumer sends message → SessionAgent routes to LLM:
-   - API key mode: direct Claude API call from Worker
-   - Local proxy: `@callable` RPC to ProviderAgent → WS to CLI → Claude API → stream back
-4. Response streams as `stream_chunk` messages
-5. After each completion: `token_update` with live counters
-6. 80% budget → warning; 95% → save/summarize prompt
-7. Session end → credits settled (reserved released, actual charged), provider earns credits
-
-## Credit Engine
-
-```
-credits = (input_tokens/1000) × creditsPerInputKToken
-        + (output_tokens/1000) × creditsPerOutputKToken
-```
-
-- **Reserve** on session start (worst-case: all budget as output tokens × outputRate)
-- **Settle** on session end in single `db.transaction()` (actual vs reserved, refund difference)
-- **Earn** provider gets full credited amount (no platform fee in MVP)
-- **Signup bonus**: 500 credits (~enough for a few medium sessions to try the platform)
-- Credits are purely internal, non-cashable
-
-### Provider disconnect mid-session
-Simplest approach: **auto-refund unused reserved credits + end session**.
-- SessionDO detects provider WS disconnect (via ProviderGatewayDO heartbeat timeout)
-- Consumer gets `session_ended` message with reason "provider_disconnected"
-- Save/export modal auto-triggered before connection fully closes
-- Credits for unused tokens refunded immediately
-- Provider reputation -0.1 per disconnect (incentivizes uptime)
-
-## Wrangler Config Additions (wrangler.jsonc)
-
-```jsonc
+```json
+// .mcp.json (in repo root, or ~/.claude/mcp.json for global)
 {
-  "durable_objects": {
-    "bindings": [
-      { "name": "SESSION_AGENT", "class_name": "SessionAgent" },
-      { "name": "PROVIDER_AGENT", "class_name": "ProviderAgent" }
-    ]
-  },
-  "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["SessionAgent", "ProviderAgent"] }
-  ],
-  "kv_namespaces": [
-    { "binding": "POOL_CACHE", "id": "<kv-namespace-id>" }
-  ],
-  "queues": {
-    "producers": [
-      { "binding": "USAGE_LOG_QUEUE", "queue": "usage-log" },
-      { "binding": "CREDIT_TX_QUEUE", "queue": "credit-tx" }
-    ],
-    "consumers": [
-      { "queue": "usage-log", "max_batch_size": 50, "max_batch_timeout": 10 },
-      { "queue": "credit-tx", "max_batch_size": 10, "max_batch_timeout": 5 }
-    ]
+  "mcpServers": {
+    "aigent": {
+      "type": "url",
+      "url": "https://mcp.aigent.community/sse?org=acme&token=at_xxx"
+    }
   }
 }
 ```
 
+Self-hosted alternative:
+```json
+{
+  "mcpServers": {
+    "aigent": {
+      "type": "url",
+      "url": "https://your-instance.example.com/sse?org=acme&token=at_xxx"
+    }
+  }
+}
+```
+
+## Monorepo Structure
+
+```
+apps/
+  data-service/src/
+    mcp/
+      server.ts               # remote MCP server (SSE transport)
+      tools/
+        context.ts            # get_organization_context tool
+        memory.ts             # get_shared_memory, search_decisions tools
+        activity.ts           # report_activity, get_recent_activities tools
+    routes/
+      orgs.ts                 # org CRUD
+      vision.ts               # vision doc CRUD (versioned)
+      activities.ts           # activity feed
+      memory.ts               # shared memory CRUD
+      members.ts              # member management + invites
+    services/
+      vision-service.ts       # version control for org context
+      activity-service.ts     # activity ingestion + feed
+      memory-service.ts       # knowledge base ops
+      member-service.ts       # invite, roles, seat management
+
+  user-application/src/routes/
+    _auth/org/$orgId/
+      dashboard.tsx           # admin: activity feed, alignment overview
+      vision.tsx              # admin: CLAUDE.md editor (versioned)
+      members.tsx             # admin: invite, manage members
+      memory.tsx              # shared knowledge base browser
+      settings.tsx            # org settings, billing
+    _auth/settings/
+      mcp-setup.tsx           # MCP connection instructions + token
+
+packages/
+  data-ops/src/drizzle/schema/
+    organizations.ts          # org, org_member
+    vision.ts                 # vision docs (versioned)
+    activities.ts             # activity log
+    memory.ts                 # shared memory entries
+    api-tokens.ts             # MCP auth tokens
+  data-ops/src/zod-schema/
+    organization.ts
+    vision.ts
+    activity.ts
+    memory.ts
+    api-token.ts
+    mcp-messages.ts           # MCP tool input/output schemas
+```
+
+## Database Schema
+
+### organization
+| Column | Type | Notes |
+|--------|------|-------|
+| id | text PK | ulid |
+| name | text | org display name |
+| slug | text UNIQUE | URL-safe identifier |
+| owner_id | text FK→user | creator/admin |
+| max_seats | int | plan limit |
+| is_active | boolean | |
+| created_at | timestamp | |
+
+### organization_member
+| Column | Type | Notes |
+|--------|------|-------|
+| id | text PK | ulid |
+| org_id | text FK→organization | |
+| user_id | text FK→user | |
+| role | enum | admin / member |
+| joined_at | timestamp | |
+| is_active | boolean | |
+
+### vision_document
+| Column | Type | Notes |
+|--------|------|-------|
+| id | text PK | ulid |
+| org_id | text FK→organization | |
+| version | int | auto-increment per org |
+| title | text | e.g. "Architecture Rules" |
+| content | text | markdown content |
+| category | enum | rules / decisions / context / goals |
+| is_active | boolean | soft-delete, only latest version served |
+| created_by | text FK→user | who wrote this version |
+| created_at | timestamp | |
+
+### activity_log
+| Column | Type | Notes |
+|--------|------|-------|
+| id | text PK | ulid |
+| org_id | text FK→organization | |
+| user_id | text FK→user | which employee's agent |
+| summary | text | what the agent did |
+| files_changed | jsonb | string[] of file paths |
+| decisions_made | jsonb | string[] of decisions |
+| tags | jsonb | string[] categorization |
+| session_id | text | Claude Code session identifier (opaque) |
+| created_at | timestamp | |
+
+### shared_memory
+| Column | Type | Notes |
+|--------|------|-------|
+| id | text PK | ulid |
+| org_id | text FK→organization | |
+| content | text | the knowledge/learning |
+| category | enum | pattern / decision / convention / learning |
+| source_activity_id | text FK→activity_log nullable | where this came from |
+| created_by | text FK→user | |
+| is_active | boolean | |
+| created_at | timestamp | |
+
+### api_token (MCP auth)
+| Column | Type | Notes |
+|--------|------|-------|
+| id | text PK | ulid |
+| user_id | text FK→user | |
+| org_id | text FK→organization | scoped to one org |
+| token_hash | text | SHA-256 hash, prefix `at_` |
+| name | text | user label |
+| last_used_at | timestamp nullable | |
+| expires_at | timestamp nullable | |
+| is_active | boolean | |
+
+## Enums
+
+```
+orgMemberRoleEnum: admin | member
+visionCategoryEnum: rules | decisions | context | goals
+memoryCategoryEnum: pattern | decision | convention | learning
+```
+
+## API Endpoints
+
+```
+# Organizations
+POST/GET        /api/orgs
+GET/PATCH/DEL   /api/orgs/:id
+
+# Members
+POST            /api/orgs/:id/members/invite
+GET             /api/orgs/:id/members
+PATCH/DEL       /api/orgs/:id/members/:memberId
+
+# Vision (versioned context docs)
+POST/GET        /api/orgs/:id/vision
+GET/PATCH/DEL   /api/orgs/:id/vision/:docId
+GET             /api/orgs/:id/vision/:docId/history    # version history
+
+# Activities (agent reports)
+POST            /api/orgs/:id/activities               # MCP server calls this
+GET             /api/orgs/:id/activities                # feed with filters
+GET             /api/orgs/:id/activities/:activityId
+
+# Shared Memory
+POST/GET        /api/orgs/:id/memory
+PATCH/DEL       /api/orgs/:id/memory/:memoryId
+GET             /api/orgs/:id/memory/search?q=          # text search
+
+# API Tokens (MCP auth)
+POST/GET        /api/tokens
+DELETE          /api/tokens/:id
+
+# MCP Server (SSE transport)
+GET             /mcp/sse?org=slug&token=at_xxx          # SSE stream
+POST            /mcp/messages                           # MCP JSON-RPC
+```
+
+## MCP Tools
+
+### get_organization_context
+Returns all active vision documents for the org. Agent should call this at session start.
+
+Input: `{}`
+Output: `{ vision: VisionDocument[], orgName: string }`
+
+### get_shared_memory
+Returns recent shared memory entries. Agent uses this to learn from org knowledge base.
+
+Input: `{ category?: string, limit?: number }`
+Output: `{ memories: SharedMemory[] }`
+
+### search_decisions
+Search past decisions and patterns.
+
+Input: `{ query: string }`
+Output: `{ results: SharedMemory[] }`
+
+### report_activity (mandatory)
+Agent reports what it did. Called at end of task or periodically.
+
+Input: `{ summary: string, filesChanged?: string[], decisionsMade?: string[], tags?: string[] }`
+Output: `{ id: string, memoryExtracted?: string }`
+
+Server-side: activity is stored, and optionally a shared_memory entry is auto-extracted from significant decisions.
+
+### get_recent_activities
+See what other agents in the org are doing.
+
+Input: `{ limit?: number, userId?: string }`
+Output: `{ activities: Activity[] }`
+
 ## Security
 
-- API keys encrypted AES-256-GCM before DB storage (ENCRYPTION_KEY as Worker secret). `api_key` mode blocked until Phase 5 encryption is implemented — Phase 1-4 support `local_proxy` mode only.
-- Better Auth session required for all API routes
-- WS upgrade validates auth before routing to DO
-- Credit balance uses optimistic locking to prevent overspend
-- CLI agent authenticates via long-lived API token (generated in settings)
+- Better Auth session for all `/api/*` routes (Google OAuth added later)
+- MCP server authenticates via `at_` prefixed API tokens (SHA-256 hashed in DB)
+- Token scoped to specific org (user must be active member)
 - All inputs validated with Zod
-- Local proxy mode: API key never leaves provider's machine
+- Vision docs versioned — edits create new version, old versions retained
+- Activity reporting mandatory — MCP server enforces via tool availability
 
 ## Implementation Phases
 
-### Phase 1 — Schema + Auth (foundation)
-- Drizzle schema + migrations for all new tables
-- Provider config CRUD
-- Token pool CRUD
-- Credit balance initialization on signup
+### Phase 1 — Schema + Auth + Org (foundation)
+- Drizzle schema + migrations for all tables
+- Better Auth setup (email/password, session)
+- Organization CRUD (create, read, update)
+- Member management (invite by email, roles: admin/member)
+- API token CRUD (generate `at_` tokens, revoke, list)
 
-### Phase 2 — Core Session (critical path)
-- SessionAgent + ProviderAgent (agents-sdk, WS hibernation, @callable RPC)
-- `useAgentChat()` React hook for consumer chat UI
-- LLM proxy service (API key mode first)
-- Token metering from Claude API `usage` field
-- Credit engine (reserve/settle)
-- Chat UI + token counter component
+### Phase 2 — Vision Store + Activity Feed (core)
+- Vision document CRUD (versioned, categorized)
+- Vision editor page (markdown editor with live preview)
+- Activity log ingestion endpoint
+- Activity feed page (filterable by user, date, tags)
+- Shared memory CRUD
+- Memory browser page with search
 
-### Phase 3 — Marketplace + Dashboards
-- Marketplace browse with KV caching
-- Provider dashboard (stats, active sessions, earnings)
-- Consumer dashboard (history, balance)
-- Queue handlers for async usage logging + credit processing
+### Phase 3 — MCP Server (the product)
+- Remote MCP server on CF Workers (SSE transport)
+- `get_organization_context` tool
+- `get_shared_memory` + `search_decisions` tools
+- `report_activity` tool (mandatory)
+- `get_recent_activities` tool
+- MCP auth middleware (token validation, org membership check)
+- MCP setup page (connection instructions, `.mcp.json` snippet with token)
 
-### Phase 4 — CLI Agent + Local Proxy
-- CLI scaffolding (commander + ws)
-- ProviderAgent `@callable` methods for CLI communication
-- WS client with reconnection + heartbeat
-- LLM forwarding with streaming
+### Phase 4 — Dashboard + Alignment (boss value)
+- Admin dashboard: activity feed overview, per-member breakdown
+- Activity timeline visualization
+- Memory auto-extraction from activities (when agent reports significant decisions)
+- Alignment alerts (admin can flag activities as misaligned)
+- Org settings: seat management, billing
 
 ### Phase 5 — Polish
-- 80%/95% token warnings
-- Session summarize/compress endpoint
-- DO alarms for time-window enforcement
-- Rate limiting, key encryption hardening
+- Vision doc diffing (compare versions)
+- Activity search (full-text)
+- Memory relevance scoring
+- Rate limiting per token
+- Self-hostable deployment guide (wrangler.jsonc template)
+- Org-level CLAUDE.md export (download as file for offline use)
+
+### Phase 6 — Cloudflare Sandbox (post-MVP)
+- CF Containers integration
+- Run Claude Code in cloud container with org context pre-injected
+- Container gets `.claude/CLAUDE.md` auto-generated from vision store
+- Container gets `.mcp.json` pre-configured
+- Web terminal UI for sandbox access
+- R2 persistent workspace per user
 
 ## Resolved Decisions
 
-1. Credits purely internal, non-cashable
-2. Provider disconnect → auto-refund + end session + reputation penalty
-3. Conversation ephemeral in DO only (clear UI warnings)
-4. Provider decides allowed models per pool (multi-model per pool)
-5. Simple reputation: 0–5 score, -0.1 per disconnect, visible on marketplace
-6. No platform fee in MVP
-7. 500 credits signup bonus
-8. No content moderation in MVP
-9. `maxTokensBudget` = output tokens only (input unpredictable, output is what providers pay for)
-10. Credit settlement always in single `db.transaction()` (reserve/settle/ledger/session update)
-11. Reserve worst-case = all budget as output tokens × `creditsPerOutputKToken` (output more expensive)
-12. `api_key` mode gated behind Phase 5 encryption. Phases 1-4 = `local_proxy` only
-13. WS auth via custom Hono WS routes (not `routeAgentRequest`) to keep auth middleware consistent
-14. `@callable()` does NOT support callback params (JSON-serialized RPC). DO-to-DO streaming uses reverse RPC: ProviderAgent calls `sessionAgent.handleProviderChunk(msg)` via `getAgentByName()`
-15. `available_days` uses JS convention: 0=Sun, 1=Mon, ..., 6=Sat. Default `[1,2,3,4,5]` = Mon-Fri
-16. DO migrations use `new_sqlite_classes` (not `new_classes`) for agents-sdk SQLite state
+1. BYOK only — users bring their own Claude API key/subscription, platform never touches Anthropic API
+2. MCP server hosted remotely on CF Workers (also self-hostable)
+3. Activity reporting mandatory per org policy
+4. Shared memory scoped per-org
+5. Auth: Better Auth with email/password now, Google OAuth later
+6. Pricing: per-seat
+7. Vision docs versioned — every edit creates new version
+8. MCP transport: SSE (standard for remote MCP servers)
+9. API tokens prefixed `at_`, stored as SHA-256 hash, scoped to one org
+10. No Anthropic API proxying — zero legal risk
+11. Activity auto-extracts shared memory from significant decisions (Phase 4)
+12. Self-hostable: same codebase, different wrangler config + own Neon DB
